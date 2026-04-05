@@ -67,7 +67,6 @@ SEC_API_EMAIL=sheldon.gomes@gmail.com python3 scripts/precompute_qqq_universe.py
 - Incremental manifest to skip already-processed filings
 
 **Not built yet (see backlog):**
-- Manifest backfill for the initial 101-ticker run
 - BigQuery ingestion
 - Web app / API layer
 - RAG/LLM explanation layer
