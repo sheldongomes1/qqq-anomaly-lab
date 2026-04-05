@@ -714,6 +714,55 @@ def _make_filing_bundle_payload(
     return payload
 
 
+def _upload_to_gcs(gcs_client: Any, bucket_name: str, blob_name: str, data: str) -> None:
+    bucket = gcs_client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_string(data, content_type="application/json")
+    print(f"gcs_upload gs://{bucket_name}/{blob_name}")
+
+
+def _load_manifest(
+    local_path: Path,
+    gcs_client: Any | None,
+    gcs_bucket: str | None,
+    gcs_blob: str,
+) -> dict[str, Any]:
+    """Load the processing manifest from GCS (preferred) or local fallback."""
+    if gcs_client and gcs_bucket:
+        try:
+            bucket = gcs_client.bucket(gcs_bucket)
+            blob = bucket.blob(gcs_blob)
+            if blob.exists():
+                data = json.loads(blob.download_as_text())
+                print(f"manifest_loaded source=gcs gs://{gcs_bucket}/{gcs_blob}")
+                return data
+        except Exception as exc:
+            print(f"manifest_gcs_load_failed reason={exc} falling_back=local")
+    if local_path.exists():
+        data = json.loads(local_path.read_text(encoding="utf-8"))
+        print(f"manifest_loaded source=local path={local_path}")
+        return data
+    print("manifest_not_found starting_fresh")
+    return {"tickers": {}}
+
+
+def _save_manifest(
+    manifest: dict[str, Any],
+    local_path: Path,
+    gcs_client: Any | None,
+    gcs_bucket: str | None,
+    gcs_blob: str,
+) -> None:
+    """Persist manifest to local disk and GCS."""
+    from datetime import datetime, timezone
+    manifest["last_updated"] = datetime.now(timezone.utc).isoformat()
+    manifest_json = json.dumps(manifest, indent=2)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_text(manifest_json, encoding="utf-8")
+    if gcs_client and gcs_bucket:
+        _upload_to_gcs(gcs_client, gcs_bucket, gcs_blob, manifest_json)
+
+
 def precompute_universe_filings(
     *,
     client: EdgarClient,
@@ -723,6 +772,8 @@ def precompute_universe_filings(
     include_quarterly: bool,
     include_html: bool,
     output_dir: str | Path,
+    gcs_bucket: str | None = None,
+    gcs_prefix: str = "qqq",
 ) -> dict[str, Any]:
     if end_year < start_year:
         raise ValueError("end_year must be >= start_year")
@@ -730,6 +781,21 @@ def precompute_universe_filings(
     years = list(range(start_year, end_year + 1))
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    _gcs_client: Any = None
+    if gcs_bucket:
+        try:
+            from google.cloud import storage as _gcs_mod  # type: ignore[import]
+            _gcs_client = _gcs_mod.Client()
+            print(f"gcs_enabled bucket={gcs_bucket} prefix={gcs_prefix}")
+        except ImportError as exc:
+            raise RuntimeError(
+                "google-cloud-storage is required for GCS upload. Run: pip install google-cloud-storage"
+            ) from exc
+
+    manifest_local = out_dir / "qqq_manifest.json"
+    manifest_blob = f"{gcs_prefix}/qqq_manifest.json"
+    manifest = _load_manifest(manifest_local, _gcs_client, gcs_bucket, manifest_blob)
 
     company_tickers = client.get_company_tickers()
     summary_rows: list[dict[str, Any]] = []
@@ -758,36 +824,51 @@ def precompute_universe_filings(
         company_dir = out_dir / ticker
         company_dir.mkdir(parents=True, exist_ok=True)
 
+        seen: set[str] = set(manifest["tickers"].get(ticker, []))
         processed = 0
+        skipped = 0
+
         for year in years:
             annual_selected = select_form_filings_for_year(tenk_df, year=year)
             if not annual_selected.empty:
                 row = annual_selected.iloc[0].to_dict()
-                filing_url = build_filing_document_url(
-                    cik=cik,
-                    accession_number=str(row["accession_number"]),
-                    primary_document=str(row["primary_document"]),
-                )
-                filing_text = client.get_text_at_url(filing_url) if include_html else None
-                payload = _make_filing_bundle_payload(
-                    ticker=ticker,
-                    year=year,
-                    filing_row=row,
-                    filing_url=filing_url,
-                    filing_text=filing_text,
-                    company_facts=company_facts,
-                )
-                stem = f"{ticker}_{year}_10K_analysis_ready.json"
-                (company_dir / stem).write_text(json.dumps(payload, indent=2), encoding="utf-8")
-                processed += 1
+                accession = str(row["accession_number"])
+                if accession in seen:
+                    skipped += 1
+                else:
+                    filing_url = build_filing_document_url(
+                        cik=cik,
+                        accession_number=accession,
+                        primary_document=str(row["primary_document"]),
+                    )
+                    filing_text = client.get_text_at_url(filing_url) if include_html else None
+                    payload = _make_filing_bundle_payload(
+                        ticker=ticker,
+                        year=year,
+                        filing_row=row,
+                        filing_url=filing_url,
+                        filing_text=filing_text,
+                        company_facts=company_facts,
+                    )
+                    stem = f"{ticker}_{year}_10K_analysis_ready.json"
+                    payload_json = json.dumps(payload, indent=2)
+                    (company_dir / stem).write_text(payload_json, encoding="utf-8")
+                    if _gcs_client:
+                        _upload_to_gcs(_gcs_client, gcs_bucket, f"{gcs_prefix}/{ticker}/{stem}", payload_json)  # type: ignore[arg-type]
+                    seen.add(accession)
+                    processed += 1
 
             if include_quarterly:
                 quarterly_selected = select_form_filings_for_year(tenq_df, year=year)
                 for idx, (_, q_row) in enumerate(quarterly_selected.iterrows(), start=1):
                     q = q_row.to_dict()
+                    accession = str(q["accession_number"])
+                    if accession in seen:
+                        skipped += 1
+                        continue
                     filing_url = build_filing_document_url(
                         cik=cik,
-                        accession_number=str(q["accession_number"]),
+                        accession_number=accession,
                         primary_document=str(q["primary_document"]),
                     )
                     filing_text = client.get_text_at_url(filing_url) if include_html else None
@@ -802,8 +883,16 @@ def precompute_universe_filings(
                     report_date = _safe_filename_segment(str(q.get("report_date") or f"{year}_Q{idx}"))
                     accession_suffix = _safe_filename_segment(str(q.get("accession_number") or "").replace("-", ""))
                     stem = f"{ticker}_{year}_10Q_{report_date}_{accession_suffix}_analysis_ready.json"
-                    (company_dir / stem).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                    payload_json = json.dumps(payload, indent=2)
+                    (company_dir / stem).write_text(payload_json, encoding="utf-8")
+                    if _gcs_client:
+                        _upload_to_gcs(_gcs_client, gcs_bucket, f"{gcs_prefix}/{ticker}/{stem}", payload_json)  # type: ignore[arg-type]
+                    seen.add(accession)
                     processed += 1
+
+        manifest["tickers"][ticker] = sorted(seen)
+        _save_manifest(manifest, manifest_local, _gcs_client, gcs_bucket, manifest_blob)
+        print(f"ticker={ticker} new={processed} skipped={skipped}")
 
         summary_rows.append(
             {
@@ -811,6 +900,7 @@ def precompute_universe_filings(
                 "cik": cik,
                 "company_name": submissions.get("name"),
                 "files_generated": processed,
+                "files_skipped": skipped,
             }
         )
 
@@ -822,7 +912,10 @@ def precompute_universe_filings(
         "ticker_count": len(tickers),
         "companies": summary_rows,
     }
-    (out_dir / "qqq_precompute_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    summary_json = json.dumps(summary, indent=2)
+    (out_dir / "qqq_precompute_summary.json").write_text(summary_json, encoding="utf-8")
+    if _gcs_client:
+        _upload_to_gcs(_gcs_client, gcs_bucket, f"{gcs_prefix}/qqq_precompute_summary.json", summary_json)  # type: ignore[arg-type]
     return summary
 
 

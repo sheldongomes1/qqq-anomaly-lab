@@ -50,6 +50,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force refresh Nasdaq-100 constituents from Nasdaq API.",
     )
+    parser.add_argument(
+        "--gcs-bucket",
+        default="",
+        help="GCS bucket to upload outputs to (e.g. qqq-anomaly-raw-sg). Omit to skip GCS upload.",
+    )
+    parser.add_argument(
+        "--gcs-prefix",
+        default="qqq",
+        help="GCS object path prefix (default: qqq).",
+    )
     return parser.parse_args()
 
 
@@ -101,6 +111,8 @@ def main() -> None:
         include_quarterly=args.include_quarterly,
         include_html=args.include_html,
         output_dir=Path(args.output_dir),
+        gcs_bucket=args.gcs_bucket or None,
+        gcs_prefix=args.gcs_prefix,
     )
 
     print(f"ticker_count={summary['ticker_count']}")

@@ -12,7 +12,8 @@ dependencies = [
   "numpy>=1.26",
   "pandas>=2.2",
   "scikit-learn>=1.5",
-  "requests>=2.32"
+  "requests>=2.32",
+  "google-cloud-storage>=2.10"
 ]
 
 [project.optional-dependencies]
