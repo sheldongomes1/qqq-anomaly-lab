@@ -25,17 +25,17 @@ _MAX_SECTION_CHARS = 100_000
 # Section header patterns applied to lowercased cleaned text.
 # Ordered by expected position in the document.
 _TENK_HEADERS: list[tuple[str, str]] = [
-    ("business", r"item\s+1[\.\s]+business"),
-    ("risk_factors", r"item\s+1a[\.\s]+risk\s+factor"),
-    ("mda", r"item\s+7[\.\s]+management"),
-    ("quantitative_disclosures", r"item\s+7a[\.\s]+quantitative"),
-    ("financial_statements", r"item\s+8[\.\s]+financial\s+statement"),
+    ("business", r"item\s+1[^\w]+business"),
+    ("risk_factors", r"item\s+1a[^\w]+risk\s+factor"),
+    ("mda", r"item\s+7[^\w]+management"),
+    ("quantitative_disclosures", r"item\s+7a[^\w]+quantitative"),
+    ("financial_statements", r"item\s+8[^\w]+financial\s+statement"),
 ]
 
 _TENQ_HEADERS: list[tuple[str, str]] = [
-    ("mda", r"item\s+2[\.\s]+management"),
-    ("risk_factors", r"item\s+1a[\.\s]+risk\s+factor"),
-    ("quantitative_disclosures", r"item\s+3[\.\s]+quantitative"),
+    ("mda", r"item\s+2[^\w]+management"),
+    ("risk_factors", r"item\s+1a[^\w]+risk\s+factor"),
+    ("quantitative_disclosures", r"item\s+3[^\w]+quantitative"),
 ]
 
 
