@@ -43,18 +43,27 @@ _SECTION_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Item 3 heading within MDA — everything from here onward is quantitative disclosures
-_ITEM3_IN_MDA_RE = re.compile(r"\bItem\s+3[\.\s]", re.IGNORECASE)
+# Item 3 heading within MDA — only when it appears as a standalone line heading,
+# not inline cross-references like "See Part I, Item 3, 'Quantitative...'"
+_ITEM3_IN_MDA_RE = re.compile(
+    r"(?:^|\n)\s*Item\s+3[^\w]+quantitative",
+    re.IGNORECASE,
+)
 
-# Boilerplate triggers — when found, remove from start of its paragraph to next blank line
-_MDA_BOILERPLATE_TRIGGERS = [
-    "Total Number of Shares Purchased",
-    "Exhibit Number",
-    "Exhibit Description",
-    "Pursuant to the requirements of the Securities Exchange Act",
-    "disclosure controls and procedures as defined in Rules",
-    "sanctions disclosure",
-    "Foreign Assets Control",
+# Truncation triggers — everything from this phrase to end-of-section is boilerplate.
+# Truncates at the nearest preceding newline so the trigger line itself is dropped.
+_MDA_TRUNCATION_TRIGGERS = [
+    "Exhibit Number",           # exhibit index listing
+    "Exhibit Description",      # exhibit index listing (alternate header)
+    "Pursuant to the requirements of the Securities Exchange Act",  # signature block
+    "disclosure controls and procedures as defined in Rules",       # SOX/Item-4 certification
+]
+
+# Block removal triggers — remove only the surrounding paragraph (bounded removal).
+_MDA_BLOCK_TRIGGERS = [
+    "Total Number of Shares Purchased",  # share-repurchase table (typically mid-MDA)
+    # NOTE: "sanctions disclosure" and "Foreign Assets Control" removed — these appear in
+    # material business disclosures (e.g. OFAC compliance) and are too broad to strip.
 ]
 
 # Deferral patterns for risk factors — ordered most-specific first
@@ -101,15 +110,24 @@ def _collapse_whitespace(text: str) -> str:
     return text.strip()
 
 
+_MAX_BOILERPLATE_BLOCK = 5_000  # never remove more than this many chars per trigger hit
+
+
 def _remove_boilerplate_block(text: str, trigger: str) -> str:
-    """Find trigger phrase and remove its surrounding paragraph block."""
+    """Find trigger phrase and remove its surrounding paragraph block.
+
+    Searches for double-newline paragraph boundaries within ±_MAX_BOILERPLATE_BLOCK
+    chars of the trigger so a single match can never delete the whole document.
+    """
     idx = text.lower().find(trigger.lower())
     if idx == -1:
         return text
-    para_start = text.rfind("\n\n", 0, idx)
-    para_start = para_start + 2 if para_start != -1 else 0
-    para_end = text.find("\n\n", idx)
-    para_end = para_end if para_end != -1 else len(text)
+    search_start = max(0, idx - _MAX_BOILERPLATE_BLOCK)
+    para_start = text.rfind("\n\n", search_start, idx)
+    para_start = para_start + 2 if para_start != -1 else search_start
+    search_end = min(len(text), idx + _MAX_BOILERPLATE_BLOCK)
+    para_end = text.find("\n\n", idx, search_end)
+    para_end = para_end if para_end != -1 else search_end
     return text[:para_start] + text[para_end:]
 
 
@@ -117,11 +135,26 @@ def _remove_boilerplate_block(text: str, trigger: str) -> str:
 # MDA cleaning
 # ---------------------------------------------------------------------------
 
+def _truncate_at_trigger(text: str, trigger: str) -> str:
+    """Remove everything from the trigger's line onward (inclusive)."""
+    idx = text.lower().find(trigger.lower())
+    if idx == -1:
+        return text
+    # Walk back to the nearest newline so we drop the whole trigger line.
+    line_start = text.rfind("\n", 0, idx)
+    cut = line_start if line_start != -1 else idx
+    return text[:cut]
+
+
 def _clean_mda(raw: str) -> str:
     text = _normalize_unicode(raw)
     text = _remove_page_markers(text)
     text = _remove_section_headers(text)
-    for trigger in _MDA_BOILERPLATE_TRIGGERS:
+    # Apply truncation triggers first — these mark the end of substantive content.
+    for trigger in _MDA_TRUNCATION_TRIGGERS:
+        text = _truncate_at_trigger(text, trigger)
+    # Apply bounded block-removal triggers for inline boilerplate.
+    for trigger in _MDA_BLOCK_TRIGGERS:
         while trigger.lower() in text.lower():
             new_text = _remove_boilerplate_block(text, trigger)
             if new_text == text:

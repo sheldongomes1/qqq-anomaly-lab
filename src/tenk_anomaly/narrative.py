@@ -39,24 +39,55 @@ _TENQ_HEADERS: list[tuple[str, str]] = [
 ]
 
 
+_MIN_SECTION_CHARS = 500  # positions yielding less content are likely TOC entries
+
+
 def extract_filing_sections(text: str, form: str) -> dict[str, str]:
     """Split cleaned filing text into named narrative sections.
+
+    For each section header, finds the candidate position that yields the most
+    content — this avoids mis-selecting table-of-contents entries or inline
+    cross-references that appear after the actual section in the document.
 
     Falls back to a truncated full_text block if no section headers are found.
     """
     headers = _TENK_HEADERS if "10-K" in form.upper() else _TENQ_HEADERS
     text_lower = text.lower()
 
-    positions: list[tuple[str, int]] = []
+    # Collect all candidate positions for each section.
+    all_candidates: dict[str, list[int]] = {}
     for name, pattern in headers:
-        # Use the last match to skip table-of-contents entries.
         matches = list(re.finditer(pattern, text_lower))
         if matches:
-            positions.append((name, matches[-1].start()))
+            all_candidates[name] = [m.start() for m in matches]
 
-    if not positions:
+    if not all_candidates:
         return {"full_text": text[:_MAX_SECTION_CHARS]}
 
+    # Pick the best candidate for each section.
+    # Strategy: try candidates from last to first; accept the first one whose
+    # content length (to the nearest following section candidate) exceeds the
+    # minimum threshold.  Fall back to the last candidate if none qualify.
+    def _pick_best(name: str, candidates: list[int]) -> int:
+        other_starts = [
+            pos
+            for other_name, cands in all_candidates.items()
+            if other_name != name
+            for pos in cands
+        ]
+        for pos in reversed(candidates):
+            # Compute tentative content length: distance to the nearest
+            # section start that comes after this position.
+            after = [s for s in other_starts if s > pos]
+            content_len = (min(after) - pos) if after else (len(text) - pos)
+            if content_len >= _MIN_SECTION_CHARS:
+                return pos
+        return candidates[-1]  # fallback: last candidate
+
+    positions: list[tuple[str, int]] = [
+        (name, _pick_best(name, cands))
+        for name, cands in all_candidates.items()
+    ]
     positions.sort(key=lambda x: x[1])
 
     sections: dict[str, str] = {}
