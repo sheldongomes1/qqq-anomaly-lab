@@ -12,11 +12,22 @@ import pandas as pd
 from .edgar_client import EdgarClient, normalize_cik
 
 
-DEFAULT_FEATURE_TAGS: dict[str, str] = {
+DEFAULT_FEATURE_TAGS: dict[str, str | list[str]] = {
     "assets_usd": "Assets",
     "liabilities_usd": "Liabilities",
-    "equity_usd": "StockholdersEquity",
-    "revenue_usd": "Revenues",
+    # Some filers report total equity inclusive of non-controlling interests.
+    "equity_usd": [
+        "StockholdersEquity",
+        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    ],
+    # ASC 606 (effective 2019) split the older "Revenues" tag into more specific concepts.
+    # List in priority order: prefer the most specific/modern tag first.
+    "revenue_usd": [
+        "RevenueFromContractWithCustomerExcludingAssessedTax",   # most common post-2019
+        "RevenueFromContractWithCustomerIncludingAssessedTax",   # less common variant
+        "Revenues",                                              # pre-2019 and some financials
+        "SalesRevenueNet",                                       # older retail/manufacturing
+    ],
     "net_income_usd": "NetIncomeLoss",
     "operating_cash_flow_usd": "NetCashProvidedByUsedInOperatingActivities",
     "shares_outstanding": "CommonStockSharesOutstanding",
@@ -445,32 +456,34 @@ def extract_companyfacts_feature_history(
     tags = feature_tags or DEFAULT_FEATURE_TAGS
     rows: list[dict[str, Any]] = []
     facts = company_facts.get("facts", {}).get("us-gaap", {})
-    for feature_name, concept in tags.items():
-        concept_obj = facts.get(concept, {})
-        units = concept_obj.get("units", {})
-        for unit_name, entries in units.items():
-            if not isinstance(entries, list):
-                continue
-            for entry in entries:
-                value = entry.get("val")
-                if value is None:
+    for feature_name, concept_or_list in tags.items():
+        concepts = [concept_or_list] if isinstance(concept_or_list, str) else concept_or_list
+        for concept in concepts:
+            concept_obj = facts.get(concept, {})
+            units = concept_obj.get("units", {})
+            for unit_name, entries in units.items():
+                if not isinstance(entries, list):
                     continue
-                end_date = entry.get("end")
-                rows.append(
-                    {
-                        "feature_name": feature_name,
-                        "concept": concept,
-                        "source": "companyfacts",
-                        "value": float(value),
-                        "unit": unit_name,
-                        "period_end": end_date,
-                        "period_start": entry.get("start"),
-                        "filed": entry.get("filed"),
-                        "fy": entry.get("fy"),
-                        "fp": entry.get("fp"),
-                        "year": int(str(end_date)[:4]) if end_date else None,
-                    }
-                )
+                for entry in entries:
+                    value = entry.get("val")
+                    if value is None:
+                        continue
+                    end_date = entry.get("end")
+                    rows.append(
+                        {
+                            "feature_name": feature_name,
+                            "concept": concept,
+                            "source": "companyfacts",
+                            "value": float(value),
+                            "unit": unit_name,
+                            "period_end": end_date,
+                            "period_start": entry.get("start"),
+                            "filed": entry.get("filed"),
+                            "fy": entry.get("fy"),
+                            "fp": entry.get("fp"),
+                            "year": int(str(end_date)[:4]) if end_date else None,
+                        }
+                    )
     return pd.DataFrame(rows)
 
 
