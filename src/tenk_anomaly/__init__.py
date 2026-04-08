@@ -1,6 +1,5 @@
 """tenk_anomaly package."""
 
-from .detector import IsolationForestDetector
 from .edgar_client import EdgarAuth, EdgarClient, normalize_cik
 from .narrative import extract_narrative_universe_filings
 from .narrative_preformat import preformat_narrative
@@ -12,7 +11,6 @@ from .sec_ingest import (
 )
 
 __all__ = [
-    "IsolationForestDetector",
     "EdgarAuth",
     "EdgarClient",
     "normalize_cik",
