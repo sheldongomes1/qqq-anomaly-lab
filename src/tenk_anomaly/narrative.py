@@ -41,6 +41,36 @@ _TENQ_HEADERS: list[tuple[str, str]] = [
 
 _MIN_SECTION_CHARS = 500  # positions yielding less content are likely TOC entries
 
+# Used by _try_mda_fallback to detect TOC-style content (many standalone page numbers).
+_TOC_NUMBER_RE = re.compile(r"\b\d{1,3}\b")
+_TOC_NUMBER_THRESHOLD = 4  # more than this many standalone 1-3-digit numbers in 500 chars → TOC
+
+
+def _try_mda_fallback(text: str) -> str | None:
+    """Find MDA content when the standard 'Item 7 / Item 2' pattern yields nothing.
+
+    Some filers (e.g. INTC, HON) use a standalone 'Management's Discussion and
+    Analysis' heading without an 'Item X' prefix.  Their primary filing document
+    is a hyperlinked TOC, so all standard Item-X matches hit short TOC entries
+    and are rejected.  This fallback searches for the standalone heading and
+    returns the first prose match (not TOC-like) with substantial content.
+    """
+    pattern = r"management.s\s+discussion\s+and\s+analysis"
+    matches = list(re.finditer(pattern, text.lower()))
+    if not matches:
+        return None
+
+    # Try from last to first; return first non-TOC-like match with enough content.
+    for m in reversed(matches):
+        pos = m.start()
+        sample = text[pos : pos + 500]
+        if len(_TOC_NUMBER_RE.findall(sample)) > _TOC_NUMBER_THRESHOLD:
+            continue  # skip TOC entries (high page-number density)
+        if len(text) - pos >= _MIN_SECTION_CHARS:
+            return text[pos : pos + _MAX_SECTION_CHARS]
+
+    return None
+
 
 def extract_filing_sections(text: str, form: str) -> dict[str, str]:
     """Split cleaned filing text into named narrative sections.
@@ -84,16 +114,37 @@ def extract_filing_sections(text: str, form: str) -> dict[str, str]:
                 return pos
         return candidates[-1]  # fallback: last candidate
 
-    positions: list[tuple[str, int]] = [
-        (name, _pick_best(name, cands))
+    selected: dict[str, int] = {
+        name: _pick_best(name, cands)
         for name, cands in all_candidates.items()
-    ]
-    positions.sort(key=lambda x: x[1])
+    }
+
+    # 10-K domain sanity: Item 1A (risk_factors) must precede Item 7 (mda).
+    # If the selected risk_factors position falls after mda, it is almost certainly
+    # an inline cross-reference captured mid-sentence (e.g. NVDA: "should be read in
+    # conjunction with 'Item 1A. Risk Factors'").  Fall back to the latest
+    # risk_factors candidate that precedes the mda start.
+    if "10-K" in form.upper() and "risk_factors" in selected and "mda" in selected:
+        if selected["risk_factors"] > selected["mda"]:
+            pre_mda = [p for p in all_candidates["risk_factors"] if p < selected["mda"]]
+            if pre_mda:
+                selected["risk_factors"] = max(pre_mda)
+
+    positions: list[tuple[str, int]] = sorted(selected.items(), key=lambda x: x[1])
 
     sections: dict[str, str] = {}
     for i, (name, start) in enumerate(positions):
         end = positions[i + 1][1] if i + 1 < len(positions) else len(text)
         sections[name] = text[start:end][:_MAX_SECTION_CHARS]
+
+    # If the MDA section is very short (likely a TOC entry was selected), try the
+    # standalone-heading fallback.  This handles filers like INTC/HON whose primary
+    # document is a cross-referenced TOC with the actual narrative under a bare
+    # "Management's Discussion and Analysis" heading.
+    if len(sections.get("mda", "")) < _MIN_SECTION_CHARS:
+        fallback = _try_mda_fallback(text)
+        if fallback:
+            sections["mda"] = fallback
 
     return sections
 
