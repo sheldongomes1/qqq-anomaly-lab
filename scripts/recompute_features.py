@@ -23,6 +23,7 @@ from tenk_anomaly import EdgarClient
 from tenk_anomaly.sec_ingest import (
     build_engineered_anomaly_features,
     combine_feature_histories,
+    extract_beneish_raw_features,
     extract_companyfacts_feature_history,
     ticker_to_cik,
 )
@@ -109,12 +110,18 @@ def main() -> None:
                 target_period_end=target_period_end,
                 target_form=target_form,
             )
+            beneish = extract_beneish_raw_features(
+                company_facts=company_facts,
+                target_period_end=target_period_end or "",
+                target_form=target_form or "",
+            )
 
             # Patch the stored file
             payload["companyfacts_feature_history"] = json.loads(
                 companyfacts_history.to_json(orient="records")
             )
             payload["engineered_anomaly_features"] = engineered
+            payload["beneish_raw_features"] = beneish
 
             out_json = json.dumps(payload, indent=2)
             f.write_text(out_json, encoding="utf-8")

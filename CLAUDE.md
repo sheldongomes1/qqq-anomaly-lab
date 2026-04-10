@@ -1,5 +1,12 @@
 # CLAUDE.md — QQQ Anomaly Lab
 
+## Permissions
+
+- **Read:** Pre-approved for all files in this directory and subdirectories. No confirmation needed before reading any file.
+- **Write:** Always ask for confirmation before creating, editing, or deleting any file.
+
+---
+
 ## Who you are working with
 
 Sheldon is building this product primarily to learn — to understand how real data pipelines, ML systems, and production-grade software are designed and built. He is not just looking for working code. He wants to understand **why** decisions are made, **what** the tradeoffs are, and **where** the work is heading.

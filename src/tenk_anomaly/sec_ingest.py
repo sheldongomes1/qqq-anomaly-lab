@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import date
+from datetime import date, timedelta
 from html import unescape
 from pathlib import Path
 from typing import Any, Iterable
@@ -32,6 +32,344 @@ DEFAULT_FEATURE_TAGS: dict[str, str | list[str]] = {
     "operating_cash_flow_usd": "NetCashProvidedByUsedInOperatingActivities",
     "shares_outstanding": "CommonStockSharesOutstanding",
 }
+
+# ── Beneish M-Score raw feature extraction ──────────────────────────────────
+# 12 raw inputs needed to compute all 8 Beneish components. Tags listed in
+# fallback priority order (first found wins).
+
+BENEISH_CONCEPT_TAGS: dict[str, list[str]] = {
+    "accounts_receivable": [
+        "AccountsReceivableNetCurrent",
+        "ReceivablesNetCurrent",
+        "AccountsReceivableNet",
+        "TradeAndOtherReceivablesNetCurrent",
+    ],
+    "revenue": [
+        "Revenues",
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "RevenueFromContractWithCustomerIncludingAssessedTax",
+        "SalesRevenueNet",
+        "SalesRevenueGoodsNet",
+    ],
+    "cost_of_revenue": [
+        "CostOfRevenue",
+        "CostOfGoodsSoldAndServicesSold",
+        "CostOfGoodsSold",
+        "CostOfServices",
+    ],
+    "current_assets": ["AssetsCurrent"],
+    "ppe_net": [
+        "PropertyPlantAndEquipmentNet",
+        "PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization",
+    ],
+    "total_assets": ["Assets"],
+    "depreciation_amortization": [
+        "DepreciationAndAmortization",
+        "DepreciationDepletionAndAmortization",
+        "Depreciation",
+    ],
+    "sga_expense": ["SellingGeneralAndAdministrativeExpense"],
+    "long_term_debt": [
+        "LongTermDebt",
+        "LongTermDebtNoncurrent",
+        "LongTermDebtAndCapitalLeaseObligations",
+    ],
+    "current_liabilities": ["LiabilitiesCurrent"],
+    "net_income": ["NetIncomeLoss"],
+    "operating_cash_flow": ["NetCashProvidedByUsedInOperatingActivities"],
+}
+
+# SG&A fallback: sum component pairs when combined tag is absent (common in SaaS)
+_BENEISH_SGA_COMPONENT_PAIRS: list[tuple[str, str]] = [
+    ("GeneralAndAdministrativeExpense", "SellingAndMarketingExpense"),
+    ("GeneralAndAdministrativeExpense", "SellingExpense"),
+]
+
+# Balance-sheet fields are point-in-time; all others are flow items.
+_BENEISH_BALANCE_SHEET_FIELDS: frozenset[str] = frozenset({
+    "accounts_receivable",
+    "current_assets",
+    "ppe_net",
+    "total_assets",
+    "long_term_debt",
+    "current_liabilities",
+})
+
+_BENEISH_FIELD_ORDER = [
+    "accounts_receivable",
+    "revenue",
+    "cost_of_revenue",
+    "current_assets",
+    "ppe_net",
+    "total_assets",
+    "depreciation_amortization",
+    "sga_expense",
+    "long_term_debt",
+    "current_liabilities",
+    "net_income",
+    "operating_cash_flow",
+]
+
+
+def _beneish_pick_value(
+    gaap_facts: dict[str, Any],
+    concepts: list[str],
+    target_end: str,
+    *,
+    is_flow: bool,
+    is_quarterly: bool,
+) -> tuple[float | None, str | None]:
+    """
+    Look up a single XBRL value for a specific period end date.
+
+    For balance-sheet items (is_flow=False): match by period_end only.
+    For flow items in annual filings: prefer duration ~365 days (±30).
+    For flow items in quarterly filings: prefer duration ~91 days (±25).
+
+    Falls back to any entry at target_end if the preferred duration is absent.
+    Returns (value, "us-gaap/<concept>") or (None, None).
+    """
+    try:
+        target_end_date = date.fromisoformat(target_end)
+    except ValueError:
+        return None, None
+
+    if is_flow:
+        target_dur = 91 if is_quarterly else 365
+        tol = 25 if is_quarterly else 30
+    else:
+        target_dur = None
+        tol = 0
+
+    def _sort_key(e: dict) -> tuple[int, str]:
+        # (0, filed) for preferred duration, (1, filed) for fallback
+        filed = e.get("filed", "")
+        if target_dur is None:
+            return (0, filed)
+        start = e.get("start")
+        if start:
+            try:
+                dur = (target_end_date - date.fromisoformat(start)).days
+                if abs(dur - target_dur) <= tol:
+                    return (0, filed)
+            except ValueError:
+                pass
+        return (1, filed)
+
+    for concept in concepts:
+        entries = gaap_facts.get(concept, {}).get("units", {})
+        for unit_entries in entries.values():
+            if not isinstance(unit_entries, list):
+                continue
+            matching = [
+                e for e in unit_entries
+                if e.get("end") == target_end and e.get("val") is not None
+            ]
+            if not matching:
+                continue
+            matching.sort(key=_sort_key)
+            return float(matching[0]["val"]), f"us-gaap/{concept}"
+
+    return None, None
+
+
+def _beneish_ytd_to_quarter(
+    gaap_facts: dict[str, Any],
+    concepts: list[str],
+    target_end: str,
+) -> tuple[float | None, str | None]:
+    """
+    Derive a single-quarter flow value by subtracting the prior YTD period.
+
+    E.g., Q3 = (Q1–Q3 YTD ending Sep 30) − (Q1–Q2 YTD ending Jun 30).
+    Only used when a single-quarter entry is not found for 10-Q filings.
+    """
+    try:
+        target_end_date = date.fromisoformat(target_end)
+        prior_qtd_approx = target_end_date - timedelta(days=91)
+    except ValueError:
+        return None, None
+
+    def _get_any_ytd(concept: str, end: str, min_dur: int = 60) -> float | None:
+        for unit_entries in gaap_facts.get(concept, {}).get("units", {}).values():
+            if not isinstance(unit_entries, list):
+                continue
+            candidates: list[tuple[int, str, float]] = []
+            for e in unit_entries:
+                if e.get("end") != end or e.get("val") is None:
+                    continue
+                start = e.get("start")
+                if start:
+                    try:
+                        dur = (date.fromisoformat(end) - date.fromisoformat(start)).days
+                        if dur >= min_dur:
+                            candidates.append((dur, e.get("filed", ""), float(e["val"])))
+                    except ValueError:
+                        pass
+            if candidates:
+                candidates.sort()
+                return candidates[0][2]
+        return None
+
+    def _get_prior_ytd(concept: str) -> float | None:
+        # Find the closest period_end to prior_qtd_approx within ±15 days
+        for unit_entries in gaap_facts.get(concept, {}).get("units", {}).values():
+            if not isinstance(unit_entries, list):
+                continue
+            for e in unit_entries:
+                if e.get("val") is None:
+                    continue
+                e_end = e.get("end")
+                if not e_end:
+                    continue
+                try:
+                    diff = abs((date.fromisoformat(e_end) - prior_qtd_approx).days)
+                    if diff <= 15:
+                        return float(e["val"])
+                except ValueError:
+                    pass
+        return None
+
+    for concept in concepts:
+        ytd_cur = _get_any_ytd(concept, target_end)
+        if ytd_cur is None:
+            continue
+        ytd_prior = _get_prior_ytd(concept)
+        if ytd_prior is not None:
+            return ytd_cur - ytd_prior, f"us-gaap/{concept} (ytd_subtraction)"
+
+    return None, None
+
+
+def extract_beneish_raw_features(
+    *,
+    company_facts: dict[str, Any],
+    target_period_end: str,
+    target_form: str,
+) -> dict[str, Any]:
+    """
+    Extract the 12 raw financial statement values needed to compute the Beneish M-Score.
+
+    Returns a dict with keys: 'current', 'prior_year_same_period', '_sources',
+    '_validation'. All values are in the filing's original XBRL units (typically
+    thousands or millions of USD). Missing tags are null — never zero-filled.
+
+    For 10-Q flow items, single-quarter values are used (not YTD cumulative). If
+    only YTD is reported, the prior-period YTD is subtracted automatically.
+    """
+    if not target_period_end:
+        return {}
+
+    gaap_facts = company_facts.get("facts", {}).get("us-gaap", {})
+    is_quarterly = str(target_form).upper().startswith("10-Q")
+
+    try:
+        current_date = date.fromisoformat(target_period_end)
+        try:
+            prior_date = current_date.replace(year=current_date.year - 1)
+        except ValueError:
+            prior_date = current_date.replace(year=current_date.year - 1, day=28)
+        prior_period_end = prior_date.isoformat()
+    except ValueError:
+        return {}
+
+    sources: dict[str, str] = {}
+    current_vals: dict[str, float | None] = {}
+    prior_vals: dict[str, float | None] = {}
+
+    for field in _BENEISH_FIELD_ORDER:
+        if field == "sga_expense":
+            continue  # handled below with component fallback logic
+
+        concepts = BENEISH_CONCEPT_TAGS[field]
+        is_flow = field not in _BENEISH_BALANCE_SHEET_FIELDS
+
+        # Current period
+        val, tag = _beneish_pick_value(
+            gaap_facts, concepts, target_period_end, is_flow=is_flow, is_quarterly=is_quarterly
+        )
+        if val is None and is_flow and is_quarterly:
+            val, tag = _beneish_ytd_to_quarter(gaap_facts, concepts, target_period_end)
+        current_vals[field] = val
+        if tag:
+            sources[field] = tag
+
+        # Prior-year same period
+        prior_val, _ = _beneish_pick_value(
+            gaap_facts, concepts, prior_period_end, is_flow=is_flow, is_quarterly=is_quarterly
+        )
+        if prior_val is None and is_flow and is_quarterly:
+            prior_val, _ = _beneish_ytd_to_quarter(gaap_facts, concepts, prior_period_end)
+        prior_vals[field] = prior_val
+
+    # SGA: combined tag first, then sum of component pairs
+    sga_cur, sga_tag = _beneish_pick_value(
+        gaap_facts,
+        BENEISH_CONCEPT_TAGS["sga_expense"],
+        target_period_end,
+        is_flow=True,
+        is_quarterly=is_quarterly,
+    )
+    sga_prior, _ = _beneish_pick_value(
+        gaap_facts,
+        BENEISH_CONCEPT_TAGS["sga_expense"],
+        prior_period_end,
+        is_flow=True,
+        is_quarterly=is_quarterly,
+    )
+
+    if sga_cur is None:
+        for ga_tag, sm_tag in _BENEISH_SGA_COMPONENT_PAIRS:
+            ga_cur, _ = _beneish_pick_value(gaap_facts, [ga_tag], target_period_end, is_flow=True, is_quarterly=is_quarterly)
+            sm_cur, _ = _beneish_pick_value(gaap_facts, [sm_tag], target_period_end, is_flow=True, is_quarterly=is_quarterly)
+            if ga_cur is not None and sm_cur is not None:
+                sga_cur = ga_cur + sm_cur
+                sga_tag = f"computed:{ga_tag}+{sm_tag}"
+                ga_pr, _ = _beneish_pick_value(gaap_facts, [ga_tag], prior_period_end, is_flow=True, is_quarterly=is_quarterly)
+                sm_pr, _ = _beneish_pick_value(gaap_facts, [sm_tag], prior_period_end, is_flow=True, is_quarterly=is_quarterly)
+                if ga_pr is not None and sm_pr is not None:
+                    sga_prior = ga_pr + sm_pr
+                break
+
+    if sga_cur is None and is_quarterly:
+        sga_cur, sga_tag = _beneish_ytd_to_quarter(
+            gaap_facts, BENEISH_CONCEPT_TAGS["sga_expense"], target_period_end
+        )
+        if sga_cur is None:
+            for ga_tag, sm_tag in _BENEISH_SGA_COMPONENT_PAIRS:
+                ga_cur, _ = _beneish_ytd_to_quarter(gaap_facts, [ga_tag], target_period_end)
+                sm_cur, _ = _beneish_ytd_to_quarter(gaap_facts, [sm_tag], target_period_end)
+                if ga_cur is not None and sm_cur is not None:
+                    sga_cur = ga_cur + sm_cur
+                    sga_tag = f"computed:{ga_tag}+{sm_tag} (ytd_subtraction)"
+                    break
+
+    current_vals["sga_expense"] = sga_cur
+    prior_vals["sga_expense"] = sga_prior
+    if sga_tag:
+        sources["sga_expense"] = sga_tag
+
+    # Validation
+    warnings: list[str] = []
+    c = current_vals
+    if c.get("revenue") is not None and c["revenue"] <= 0:
+        warnings.append("current.revenue <= 0")
+    if c.get("accounts_receivable") is not None and c.get("total_assets") is not None:
+        if c["accounts_receivable"] > c["total_assets"]:
+            warnings.append("accounts_receivable > total_assets")
+    if c.get("current_assets") is not None and c.get("total_assets") is not None:
+        if c["current_assets"] > c["total_assets"]:
+            warnings.append("current_assets > total_assets")
+    if c.get("ppe_net") is not None and c.get("total_assets") is not None:
+        if c["ppe_net"] > c["total_assets"]:
+            warnings.append("ppe_net > total_assets")
+
+    return {
+        "current": {f: current_vals.get(f) for f in _BENEISH_FIELD_ORDER},
+        "prior_year_same_period": {f: prior_vals.get(f) for f in _BENEISH_FIELD_ORDER},
+        "_sources": sources,
+        "_validation": {"warnings": warnings},
+    }
 
 
 def _safe_list(mapping: dict[str, Any], *keys: str) -> list[Any]:
@@ -652,6 +990,96 @@ def build_engineered_anomaly_features(
             if str(period_key)[:4].isdigit()
         }
     )
+
+    # --- Denominator guardrails ---
+    # total_assets <= 0 is always a data extraction error; null it so all asset
+    # ratios (debt_to_assets, ocf_to_assets, accrual_ratio, equity_multiplier)
+    # come out null rather than inf or a meaningless extreme value.
+    if assets is not None and assets <= 0:
+        assets = None
+
+    # Revenue <= 0 means wrong XBRL tag or no-revenue period (holding co, post-spin).
+    # Dividing by near-zero revenue produces net_margin values orders of magnitude
+    # outside any meaningful range.
+    if revenue is not None and revenue <= 0:
+        revenue = None
+
+    feature_flags: dict[str, bool] = {}
+
+    # --- accrual_ratio: use average assets when prior period is available ---
+    assets_prior = get_previous_year_same_period("assets_usd", resolved_target_period)
+    if assets_prior is None:
+        assets_prior = get_latest_for_year("assets_usd", target_year - 1)
+
+    if assets_prior is None:
+        avg_assets = assets
+        if assets is not None:
+            feature_flags["accrual_ratio_single_period_assets"] = True
+    else:
+        avg_assets = (assets + assets_prior) / 2 if (assets is not None and assets_prior is not None) else None
+
+    # Sanity check: avg_assets implausibly small relative to current assets
+    if avg_assets is not None and assets is not None and abs(avg_assets) < 0.01 * abs(assets):
+        avg_assets = None
+        feature_flags["accrual_ratio_unstable_denominator"] = True
+
+    accrual_numerator = (
+        (net_income - operating_cash_flow)
+        if (net_income is not None and operating_cash_flow is not None)
+        else None
+    )
+    accrual_ratio = safe_div(accrual_numerator, avg_assets)
+
+    # --- ocf_to_net_income: cap output at ±10 ---
+    # A ratio outside ±10 is universally a data artifact from near-zero net income,
+    # not a real signal. The accrual_ratio captures the same earnings quality
+    # signal in a more stable, asset-scaled form.
+    _ocf_to_ni_raw = safe_div(operating_cash_flow, net_income)
+    if _ocf_to_ni_raw is not None and abs(_ocf_to_ni_raw) > 10:
+        _ocf_to_ni_raw = None
+        feature_flags["ocf_to_net_income_unstable"] = True
+    ocf_to_net_income = _ocf_to_ni_raw
+
+    # --- equity_multiplier: assets / equity with near-zero equity guard ---
+    # Negative equity is valid (aggressive buybacks, e.g. STX). But when equity
+    # is within ~2% of zero the ratio swings wildly and has no analytical meaning.
+    _min_equity_threshold = 0.02 * assets if assets is not None else None
+    if equity is None:
+        equity_multiplier = None
+    elif _min_equity_threshold is not None and abs(equity) < _min_equity_threshold:
+        equity_multiplier = None
+        feature_flags["equity_multiplier_near_zero_equity"] = True
+    else:
+        equity_multiplier = safe_div(assets, equity)
+
+    # --- revenue_yoy_growth: flag if > 10x (900% growth) ---
+    # Early-stage companies post-IPO can show 2,000–5,000% YoY growth that is
+    # technically correct but dominates every z-score in the distribution.
+    _rev_cur = get_value("revenue_usd", resolved_target_period)
+    _rev_prev = get_previous_year_same_period("revenue_usd", resolved_target_period)
+    if _rev_cur is None or _rev_prev is None:
+        _rev_cur = get_latest_for_year("revenue_usd", target_year)
+        _rev_prev = get_latest_for_year("revenue_usd", target_year - 1)
+    if _rev_cur is None or _rev_prev in (None, 0) or _rev_prev <= 0:
+        revenue_growth_yoy = None
+    else:
+        revenue_growth_yoy = (_rev_cur - _rev_prev) / _rev_prev
+        if _rev_cur / _rev_prev > 10:
+            feature_flags["revenue_yoy_growth_extreme"] = True
+
+    # --- assets_yoy_growth: flag if > 5x (400% growth) ---
+    _assets_cur = get_value("assets_usd", resolved_target_period)
+    _assets_prev = get_previous_year_same_period("assets_usd", resolved_target_period)
+    if _assets_cur is None or _assets_prev is None:
+        _assets_cur = get_latest_for_year("assets_usd", target_year)
+        _assets_prev = get_latest_for_year("assets_usd", target_year - 1)
+    if _assets_cur is None or _assets_prev in (None, 0) or _assets_prev <= 0:
+        assets_growth_yoy = None
+    else:
+        assets_growth_yoy = (_assets_cur - _assets_prev) / _assets_prev
+        if _assets_cur / _assets_prev > 5:
+            feature_flags["assets_yoy_growth_extreme"] = True
+
     return {
         "target_year": int(target_year),
         "target_period_end": resolved_target_period,
@@ -661,11 +1089,14 @@ def build_engineered_anomaly_features(
         "debt_to_assets": safe_div(liabilities, assets),
         "equity_to_assets": safe_div(equity, assets),
         "net_margin": safe_div(net_income, revenue),
-        "ocf_to_net_income": safe_div(operating_cash_flow, net_income),
-        "accrual_ratio": safe_div((net_income - operating_cash_flow) if (net_income is not None and operating_cash_flow is not None) else None, assets),
-        "revenue_growth_yoy": growth("revenue_usd", resolved_target_period, target_year),
-        "assets_growth_yoy": growth("assets_usd", resolved_target_period, target_year),
+        "ocf_to_net_income": ocf_to_net_income,
+        "ocf_to_assets": safe_div(operating_cash_flow, assets),
+        "accrual_ratio": accrual_ratio,
+        "equity_multiplier": equity_multiplier,
+        "revenue_growth_yoy": revenue_growth_yoy,
+        "assets_growth_yoy": assets_growth_yoy,
         "net_income_growth_yoy": growth("net_income_usd", resolved_target_period, target_year),
+        "_feature_flags": feature_flags,
     }
 
 
@@ -683,11 +1114,18 @@ def _make_filing_bundle_payload(
     company_facts: dict[str, Any],
 ) -> dict[str, Any]:
     feature_history = extract_companyfacts_feature_history(company_facts=company_facts)
+    target_period_end = str(filing_row.get("report_date") or "")
+    target_form = str(filing_row.get("form") or "")
     engineered = build_engineered_anomaly_features(
         feature_history=feature_history,
         target_year=year,
-        target_period_end=str(filing_row.get("report_date") or ""),
-        target_form=str(filing_row.get("form") or ""),
+        target_period_end=target_period_end,
+        target_form=target_form,
+    )
+    beneish = extract_beneish_raw_features(
+        company_facts=company_facts,
+        target_period_end=target_period_end,
+        target_form=target_form,
     )
 
     payload: dict[str, Any] = {
@@ -696,6 +1134,7 @@ def _make_filing_bundle_payload(
         "selected_filing_url": filing_url,
         "companyfacts_feature_history": _df_records_with_nulls(feature_history),
         "engineered_anomaly_features": engineered,
+        "beneish_raw_features": beneish,
     }
 
     if filing_text is not None:

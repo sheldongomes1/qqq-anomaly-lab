@@ -16,7 +16,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from config.scoring_exclusions import SCORING_EXCLUSIONS
 
 from google.cloud import bigquery
 
@@ -36,15 +40,43 @@ _SCHEMA = [
     bigquery.SchemaField("report_date", "DATE"),
     bigquery.SchemaField("filing_url", "STRING"),
     bigquery.SchemaField("feature_count", "INTEGER"),
-    # Engineered features — nullable because not every filing has all 7
+    # Engineered features — nullable because not every filing has all features
     bigquery.SchemaField("debt_to_assets", "FLOAT"),
     bigquery.SchemaField("equity_to_assets", "FLOAT"),
     bigquery.SchemaField("net_margin", "FLOAT"),
     bigquery.SchemaField("ocf_to_net_income", "FLOAT"),
+    bigquery.SchemaField("ocf_to_assets", "FLOAT"),
     bigquery.SchemaField("accrual_ratio", "FLOAT"),
+    bigquery.SchemaField("equity_multiplier", "FLOAT"),
     bigquery.SchemaField("revenue_growth_yoy", "FLOAT"),
     bigquery.SchemaField("assets_growth_yoy", "FLOAT"),
     bigquery.SchemaField("net_income_growth_yoy", "FLOAT"),
+    # Beneish M-Score raw inputs — current period (b_curr_*) and prior year
+    # same period (b_prior_*). Raw USD values, not ratios. Null when not reported.
+    bigquery.SchemaField("b_curr_accounts_receivable", "FLOAT"),
+    bigquery.SchemaField("b_curr_revenue", "FLOAT"),
+    bigquery.SchemaField("b_curr_cost_of_revenue", "FLOAT"),
+    bigquery.SchemaField("b_curr_current_assets", "FLOAT"),
+    bigquery.SchemaField("b_curr_ppe_net", "FLOAT"),
+    bigquery.SchemaField("b_curr_total_assets", "FLOAT"),
+    bigquery.SchemaField("b_curr_depreciation_amortization", "FLOAT"),
+    bigquery.SchemaField("b_curr_sga_expense", "FLOAT"),
+    bigquery.SchemaField("b_curr_long_term_debt", "FLOAT"),
+    bigquery.SchemaField("b_curr_current_liabilities", "FLOAT"),
+    bigquery.SchemaField("b_curr_net_income", "FLOAT"),
+    bigquery.SchemaField("b_curr_operating_cash_flow", "FLOAT"),
+    bigquery.SchemaField("b_prior_accounts_receivable", "FLOAT"),
+    bigquery.SchemaField("b_prior_revenue", "FLOAT"),
+    bigquery.SchemaField("b_prior_cost_of_revenue", "FLOAT"),
+    bigquery.SchemaField("b_prior_current_assets", "FLOAT"),
+    bigquery.SchemaField("b_prior_ppe_net", "FLOAT"),
+    bigquery.SchemaField("b_prior_total_assets", "FLOAT"),
+    bigquery.SchemaField("b_prior_depreciation_amortization", "FLOAT"),
+    bigquery.SchemaField("b_prior_sga_expense", "FLOAT"),
+    bigquery.SchemaField("b_prior_long_term_debt", "FLOAT"),
+    bigquery.SchemaField("b_prior_current_liabilities", "FLOAT"),
+    bigquery.SchemaField("b_prior_net_income", "FLOAT"),
+    bigquery.SchemaField("b_prior_operating_cash_flow", "FLOAT"),
 ]
 
 _FEATURE_COLS = [
@@ -52,10 +84,27 @@ _FEATURE_COLS = [
     "equity_to_assets",
     "net_margin",
     "ocf_to_net_income",
+    "ocf_to_assets",
     "accrual_ratio",
+    "equity_multiplier",
     "revenue_growth_yoy",
     "assets_growth_yoy",
     "net_income_growth_yoy",
+]
+
+_BENEISH_FIELDS = [
+    "accounts_receivable",
+    "revenue",
+    "cost_of_revenue",
+    "current_assets",
+    "ppe_net",
+    "total_assets",
+    "depreciation_amortization",
+    "sga_expense",
+    "long_term_debt",
+    "current_liabilities",
+    "net_income",
+    "operating_cash_flow",
 ]
 
 
@@ -100,6 +149,16 @@ def _build_row(payload: dict) -> dict | None:
         val = eng.get(col)
         row[col] = float(val) if val is not None else None
 
+    # Flatten Beneish raw inputs from beneish_raw_features.current / .prior_year_same_period
+    beneish = payload.get("beneish_raw_features", {})
+    curr = beneish.get("current", {})
+    prior = beneish.get("prior_year_same_period", {})
+    for field in _BENEISH_FIELDS:
+        c_val = curr.get(field)
+        p_val = prior.get(field)
+        row[f"b_curr_{field}"] = float(c_val) if c_val is not None else None
+        row[f"b_prior_{field}"] = float(p_val) if p_val is not None else None
+
     return row
 
 
@@ -131,10 +190,20 @@ def main() -> None:
     else:
         tickers = sorted(p.name for p in input_root.iterdir() if p.is_dir())
 
+    # Log scoring exclusions
+    if SCORING_EXCLUSIONS:
+        print(f"scoring_exclusions={list(SCORING_EXCLUSIONS.keys())}")
+        for t, reason in SCORING_EXCLUSIONS.items():
+            print(f"  excluded {t}: {reason[:80]}...")
+
     # Build rows
     rows: list[dict] = []
     skipped = 0
+    excluded = 0
     for ticker in tickers:
+        if ticker in SCORING_EXCLUSIONS:
+            excluded += 1
+            continue
         for f in sorted((input_root / ticker).glob("*.json")):
             payload = json.loads(f.read_text(encoding="utf-8"))
             row = _build_row(payload)
@@ -143,7 +212,7 @@ def main() -> None:
                 continue
             rows.append(row)
 
-    print(f"rows_built={len(rows)} skipped={skipped}")
+    print(f"rows_built={len(rows)} skipped={skipped} excluded_tickers={excluded}")
 
     if not rows:
         print("Nothing to load.")
