@@ -36,6 +36,12 @@ reports/*
 !models/.gitkeep
 !reports/.gitkeep
 
+# Secrets and credentials
+.env*
+*.json.key
+*-credentials.json
+*-service-account.json
+
 # IDE
 .DS_Store
 .idea/
